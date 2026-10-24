@@ -75,6 +75,7 @@ public sealed class HpPowerService
         (7, HpThermalMode.Silent)
     ];
 
+    private static readonly bool CachedIsAdmin = CheckIsAdministrator();
     private string? _cachedModel;
     private string? _cachedBios;
     private HashSet<HpThermalMode>? _cachedSupportedModes;
@@ -91,18 +92,34 @@ public sealed class HpPowerService
     [DllImport("powrprof.dll", ExactSpelling = true)]
     private static extern uint PowerSetUserConfiguredDCPowerMode(ref Guid powerPlanGuid);
 
-    public static bool IsRunningAsAdministrator()
+    public static bool IsRunningAsAdministrator() => CachedIsAdmin;
+
+    private static bool CheckIsAdministrator()
     {
         using var identity = WindowsIdentity.GetCurrent();
         var principal = new WindowsPrincipal(identity);
         return principal.IsInRole(WindowsBuiltInRole.Administrator);
     }
 
-    public SystemPowerSnapshot GetSnapshot()
+    public Task<SystemPowerSnapshot> GetSnapshotAsync() =>
+        Task.Run(GetSnapshotCore);
+
+    public Task<(bool Success, string Message, double ElapsedMs)> SetHpThermalModeAsync(
+        HpThermalMode mode,
+        bool syncWindowsOverlay = true) =>
+        Task.Run(() => SetHpThermalModeCore(mode, syncWindowsOverlay));
+
+    public Task<(bool Success, string Message, double ElapsedMs)> SetOverlayPowerModeAsync(
+        WindowsOverlayPowerMode mode,
+        bool applyToAc,
+        bool applyToDc) =>
+        Task.Run(() => SetOverlayPowerModeCore(mode, applyToAc, applyToDc));
+
+    private SystemPowerSnapshot GetSnapshotCore()
     {
         EnsureHardwareMetadata();
 
-        bool isAdmin = IsRunningAsAdministrator();
+        bool isAdmin = CachedIsAdmin;
         var powerStatus = SystemInformation.PowerStatus;
         bool isAc = powerStatus.PowerLineStatus == PowerLineStatus.Online;
         int batteryPct = (int)Math.Round(powerStatus.BatteryLifePercent * 100.0);
@@ -147,20 +164,16 @@ public sealed class HpPowerService
         ];
     }
 
-    public (bool Success, string Message, double ElapsedMs) SetHpThermalMode(
+    private (bool Success, string Message, double ElapsedMs) SetHpThermalModeCore(
         HpThermalMode mode,
-        bool syncWindowsOverlay = true)
+        bool syncWindowsOverlay)
     {
         var sw = Stopwatch.StartNew();
         try
         {
             bool isAc = SystemInformation.PowerStatus.PowerLineStatus == PowerLineStatus.Online;
-            if (mode == HpThermalMode.PowerSaver && isAc)
-            {
-                // Note: HP BIOS allows setting PowerSaver or we can still send it and warn if BIOS ignores on AC
-            }
 
-            if (!IsRunningAsAdministrator())
+            if (!CachedIsAdmin)
             {
                 sw.Stop();
                 return (false, "Administrator privileges are required to write HP BIOS WMI thermal commands.", sw.Elapsed.TotalMilliseconds);
@@ -176,7 +189,7 @@ public sealed class HpPowerService
             if (syncWindowsOverlay)
             {
                 var overlayTarget = MapThermalToWindowsOverlay(mode);
-                SetOverlayPowerMode(overlayTarget, applyToAc: isAc, applyToDc: !isAc);
+                SetOverlayPowerModeCore(overlayTarget, applyToAc: isAc, applyToDc: !isAc);
             }
 
             sw.Stop();
@@ -189,7 +202,7 @@ public sealed class HpPowerService
         }
     }
 
-    public (bool Success, string Message, double ElapsedMs) SetOverlayPowerMode(
+    private (bool Success, string Message, double ElapsedMs) SetOverlayPowerModeCore(
         WindowsOverlayPowerMode mode,
         bool applyToAc,
         bool applyToDc)
@@ -244,7 +257,7 @@ public sealed class HpPowerService
         _ => mode.ToString()
     };
 
-    private WindowsOverlayPowerMode GetAcOverlayPowerMode()
+    private static WindowsOverlayPowerMode GetAcOverlayPowerMode()
     {
         try
         {
@@ -255,7 +268,7 @@ public sealed class HpPowerService
         return WindowsOverlayPowerMode.Balanced;
     }
 
-    private WindowsOverlayPowerMode GetDcOverlayPowerMode()
+    private static WindowsOverlayPowerMode GetDcOverlayPowerMode()
     {
         try
         {
@@ -285,13 +298,18 @@ public sealed class HpPowerService
         if (_cachedModel != null && _cachedBios != null)
             return;
 
+        var options = new EnumerationOptions { Timeout = TimeSpan.FromSeconds(2), ReturnImmediately = true };
+
         try
         {
-            using var csSearcher = new ManagementObjectSearcher("SELECT Model FROM Win32_ComputerSystem");
+            using var csSearcher = new ManagementObjectSearcher(@"\\.\root\cimv2", "SELECT Model FROM Win32_ComputerSystem", options);
             foreach (ManagementObject obj in csSearcher.Get())
             {
-                _cachedModel = obj["Model"]?.ToString()?.Trim();
-                break;
+                using (obj)
+                {
+                    _cachedModel = obj["Model"]?.ToString()?.Trim();
+                    break;
+                }
             }
         }
         catch
@@ -301,11 +319,14 @@ public sealed class HpPowerService
 
         try
         {
-            using var biosSearcher = new ManagementObjectSearcher("SELECT SMBIOSBIOSVersion, Manufacturer FROM Win32_BIOS");
+            using var biosSearcher = new ManagementObjectSearcher(@"\\.\root\cimv2", "SELECT SMBIOSBIOSVersion, Manufacturer FROM Win32_BIOS", options);
             foreach (ManagementObject obj in biosSearcher.Get())
             {
-                _cachedBios = $"{obj["Manufacturer"]} {obj["SMBIOSBIOSVersion"]}".Trim();
-                break;
+                using (obj)
+                {
+                    _cachedBios = $"{obj["Manufacturer"]} {obj["SMBIOSBIOSVersion"]}".Trim();
+                    break;
+                }
             }
         }
         catch
@@ -357,11 +378,7 @@ public sealed class HpPowerService
         return defaultSet;
     }
 
-    private static bool IsBitSet(byte b, int bitIndex)
-    {
-        // Matches HP.SystemControl.Utility.Features.SystemControl.SystemControlCoreBase.IsBitExists(byte b, int bit)
-        return ((b >> bitIndex) & 1) == 1;
-    }
+    private static bool IsBitSet(byte b, int bitIndex) => ((b >> bitIndex) & 1) == 1;
 
     private static HpThermalMode? GetCurrentBiosMode(bool isAdmin, out string statusMessage)
     {
@@ -393,12 +410,13 @@ public sealed class HpPowerService
         return null;
     }
 
-    private static bool ExecuteBiosReadCommand(
+    internal static bool ExecuteBiosReadCommand(
         uint commandType,
         string methodName,
         out byte[]? returnData,
         out uint returnCode,
-        out string error)
+        out string error,
+        uint command = CmdRead)
     {
         returnData = null;
         returnCode = 0xFFFF;
@@ -406,10 +424,11 @@ public sealed class HpPowerService
 
         try
         {
-            var scope = new ManagementScope(@"\\.\root\wmi");
+            var scope = new ManagementScope(@"\\.\root\wmi", new ConnectionOptions { Timeout = TimeSpan.FromSeconds(2) });
             scope.Connect();
 
-            using var searcher = new ManagementObjectSearcher(scope, new ObjectQuery("SELECT * FROM hpqBIntM"));
+            var queryOpts = new EnumerationOptions { Timeout = TimeSpan.FromSeconds(2), ReturnImmediately = true };
+            using var searcher = new ManagementObjectSearcher(scope, new ObjectQuery("SELECT * FROM hpqBIntM"), queryOpts);
             foreach (ManagementObject instance in searcher.Get())
             {
                 using (instance)
@@ -417,7 +436,7 @@ public sealed class HpPowerService
                     using var inDataClass = new ManagementClass(scope, new ManagementPath("hpqBDataIn"), null);
                     using ManagementBaseObject inData = inDataClass.CreateInstance();
                     inData["Sign"] = HpSecuSign;
-                    inData["Command"] = CmdRead;
+                    inData["Command"] = command;
                     inData["CommandType"] = commandType;
                     inData["Size"] = 0u;
 
@@ -455,10 +474,11 @@ public sealed class HpPowerService
 
         try
         {
-            var scope = new ManagementScope(@"\\.\root\wmi");
+            var scope = new ManagementScope(@"\\.\root\wmi", new ConnectionOptions { Timeout = TimeSpan.FromSeconds(2) });
             scope.Connect();
 
-            using var searcher = new ManagementObjectSearcher(scope, new ObjectQuery("SELECT * FROM hpqBIntM"));
+            var queryOpts = new EnumerationOptions { Timeout = TimeSpan.FromSeconds(2), ReturnImmediately = true };
+            using var searcher = new ManagementObjectSearcher(scope, new ObjectQuery("SELECT * FROM hpqBIntM"), queryOpts);
             foreach (ManagementObject instance in searcher.Get())
             {
                 using (instance)
@@ -471,7 +491,6 @@ public sealed class HpPowerService
                     inData["Size"] = (uint)payload.Length;
                     inData["hpqBData"] = payload;
 
-                    // Try hpqBIOSInt0 first (0-byte return data, matchingSetThermalControlMode returnDataSize=0), fallback to hpqBIOSInt4
                     foreach (string methodName in new[] { "hpqBIOSInt0", "hpqBIOSInt4" })
                     {
                         using ManagementBaseObject inParams = instance.GetMethodParameters(methodName);
