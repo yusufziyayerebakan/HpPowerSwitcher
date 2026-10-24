@@ -1,0 +1,5 @@
+namespace HpPowerSwitcher;
+
+public partial class App : System.Windows.Application
+{
+}
