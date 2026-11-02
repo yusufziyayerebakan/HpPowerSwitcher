@@ -2,7 +2,7 @@ using System.Diagnostics;
 using System.Management;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
-using System.Windows.Forms;
+
 
 namespace HpPowerSwitcher.Services;
 
@@ -120,16 +120,10 @@ public sealed class HpPowerService
         EnsureHardwareMetadata();
 
         bool isAdmin = CachedIsAdmin;
-        var powerStatus = SystemInformation.PowerStatus;
-        bool isAc = powerStatus.PowerLineStatus == PowerLineStatus.Online;
-        int batteryPct = (int)Math.Round(powerStatus.BatteryLifePercent * 100.0);
-        if (batteryPct < 0 || batteryPct > 100) batteryPct = 100;
-
-        string batteryText = isAc
-            ? (powerStatus.BatteryChargeStatus.HasFlag(BatteryChargeStatus.Charging)
-                ? $"{batteryPct}% (Charging on AC)"
-                : $"{batteryPct}% (Plugged In)")
-            : $"{batteryPct}% (On Battery)";
+        var powerStatus = PowerStatus.Read();
+        bool isAc = powerStatus.IsOnAc;
+        int batteryPct = powerStatus.BatteryPercent;
+        string batteryText = powerStatus.Description;
 
         var supported = GetSupportedBiosModes(isAdmin);
         var currentBios = GetCurrentBiosMode(isAdmin, out string biosStatus);
@@ -153,15 +147,15 @@ public sealed class HpPowerService
 
     public static IReadOnlyList<ThermalModeOption> GetAllModeOptions(IReadOnlySet<HpThermalMode> supportedModes)
     {
-        return
-        [
+        return new ThermalModeOption[]
+        {
             new(HpThermalMode.SmartSense, "Smart Sense", "AI auto-adapts power & fan speed to workload", "⚡", "#38BDF8", supportedModes.Contains(HpThermalMode.SmartSense)),
             new(HpThermalMode.Balanced, "Balanced", "Recommended balance of performance and noise", "⚖", "#34D399", supportedModes.Contains(HpThermalMode.Balanced)),
             new(HpThermalMode.Performance, "Performance", "Maximum CPU/GPU wattage & active cooling", "🚀", "#F97316", supportedModes.Contains(HpThermalMode.Performance)),
             new(HpThermalMode.Cool, "Cool", "Keeps surface & lap temperatures lower", "❄", "#60A5FA", supportedModes.Contains(HpThermalMode.Cool)),
             new(HpThermalMode.Quiet, "Quiet", "Minimizes fan spin and acoustic noise", "🌙", "#A78BFA", supportedModes.Contains(HpThermalMode.Quiet)),
             new(HpThermalMode.PowerSaver, "Power Saver", "Reduces CPU package power for max battery", "🍃", "#4ADE80", supportedModes.Contains(HpThermalMode.PowerSaver))
-        ];
+        };
     }
 
     private (bool Success, string Message, double ElapsedMs) SetHpThermalModeCore(
@@ -171,7 +165,7 @@ public sealed class HpPowerService
         var sw = Stopwatch.StartNew();
         try
         {
-            bool isAc = SystemInformation.PowerStatus.PowerLineStatus == PowerLineStatus.Online;
+            bool isAc = PowerStatus.Read().IsOnAc;
 
             if (!CachedIsAdmin)
             {
@@ -298,12 +292,13 @@ public sealed class HpPowerService
         if (_cachedModel != null && _cachedBios != null)
             return;
 
-        var options = new EnumerationOptions { Timeout = TimeSpan.FromSeconds(2), ReturnImmediately = true };
+        var options = new System.Management.EnumerationOptions { Timeout = TimeSpan.FromSeconds(2), ReturnImmediately = true };
 
         try
         {
             using var csSearcher = new ManagementObjectSearcher(@"\\.\root\cimv2", "SELECT Model FROM Win32_ComputerSystem", options);
-            foreach (ManagementObject obj in csSearcher.Get())
+            using var queryResults = csSearcher.Get();
+            foreach (ManagementObject obj in queryResults)
             {
                 using (obj)
                 {
@@ -320,7 +315,8 @@ public sealed class HpPowerService
         try
         {
             using var biosSearcher = new ManagementObjectSearcher(@"\\.\root\cimv2", "SELECT SMBIOSBIOSVersion, Manufacturer FROM Win32_BIOS", options);
-            foreach (ManagementObject obj in biosSearcher.Get())
+            using var queryResults = biosSearcher.Get();
+            foreach (ManagementObject obj in queryResults)
             {
                 using (obj)
                 {
@@ -427,9 +423,10 @@ public sealed class HpPowerService
             var scope = new ManagementScope(@"\\.\root\wmi", new ConnectionOptions { Timeout = TimeSpan.FromSeconds(2) });
             scope.Connect();
 
-            var queryOpts = new EnumerationOptions { Timeout = TimeSpan.FromSeconds(2), ReturnImmediately = true };
+            var queryOpts = new System.Management.EnumerationOptions { Timeout = TimeSpan.FromSeconds(2), ReturnImmediately = true };
             using var searcher = new ManagementObjectSearcher(scope, new ObjectQuery("SELECT * FROM hpqBIntM"), queryOpts);
-            foreach (ManagementObject instance in searcher.Get())
+            using var queryResults = searcher.Get();
+            foreach (ManagementObject instance in queryResults)
             {
                 using (instance)
                 {
@@ -477,9 +474,10 @@ public sealed class HpPowerService
             var scope = new ManagementScope(@"\\.\root\wmi", new ConnectionOptions { Timeout = TimeSpan.FromSeconds(2) });
             scope.Connect();
 
-            var queryOpts = new EnumerationOptions { Timeout = TimeSpan.FromSeconds(2), ReturnImmediately = true };
+            var queryOpts = new System.Management.EnumerationOptions { Timeout = TimeSpan.FromSeconds(2), ReturnImmediately = true };
             using var searcher = new ManagementObjectSearcher(scope, new ObjectQuery("SELECT * FROM hpqBIntM"), queryOpts);
-            foreach (ManagementObject instance in searcher.Get())
+            using var queryResults = searcher.Get();
+            foreach (ManagementObject instance in queryResults)
             {
                 using (instance)
                 {

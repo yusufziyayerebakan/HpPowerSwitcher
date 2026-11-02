@@ -1,42 +1,36 @@
-using System.Windows;
-using System.Windows.Controls;
-using System.Windows.Input;
+using Microsoft.UI.Xaml;
 
 namespace HpPowerSwitcher;
 
-public partial class App : System.Windows.Application
+public partial class App : Application
 {
-    protected override void OnStartup(StartupEventArgs e)
-    {
-        base.OnStartup(e);
+    private MainWindow? _window;
 
-        // Smooth horizontal scrolling on mouse wheel for horizontal scroll regions or when Shift is held
-        EventManager.RegisterClassHandler(
-            typeof(ScrollViewer),
-            UIElement.PreviewMouseWheelEvent,
-            new MouseWheelEventHandler(OnScrollViewerPreviewMouseWheel));
+    public App()
+    {
+        UnhandledException += (_, e) => LogError(e.Exception);
+        try { InitializeComponent(); }
+        catch (Exception ex) { LogError(ex); throw; }
     }
 
-    private static void OnScrollViewerPreviewMouseWheel(object sender, MouseWheelEventArgs e)
+    protected override void OnLaunched(LaunchActivatedEventArgs args)
     {
-        if (sender is not ScrollViewer sv) return;
-
-        bool isHorizontalOnly = sv.HorizontalScrollBarVisibility != ScrollBarVisibility.Disabled &&
-                                (sv.VerticalScrollBarVisibility == ScrollBarVisibility.Disabled || sv.ScrollableHeight == 0);
-
-        bool isShiftDown = (Keyboard.Modifiers & ModifierKeys.Shift) == ModifierKeys.Shift;
-
-        if ((isHorizontalOnly || isShiftDown) && sv.ScrollableWidth > 0)
+        try
         {
-            if (e.Delta < 0)
-            {
-                sv.ScrollToHorizontalOffset(sv.HorizontalOffset + 48);
-            }
-            else if (e.Delta > 0)
-            {
-                sv.ScrollToHorizontalOffset(sv.HorizontalOffset - 48);
-            }
-            e.Handled = true;
+            _window = new MainWindow();
+            _window.Activate();
         }
+        catch (Exception ex) { LogError(ex); throw; }
+    }
+
+    private static void LogError(Exception exception)
+    {
+        try
+        {
+            string directory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "HpPowerSwitcher");
+            Directory.CreateDirectory(directory);
+            File.WriteAllText(Path.Combine(directory, "last-error.txt"), $"{DateTimeOffset.Now:O}\n{exception}");
+        }
+        catch { /* Error reporting must not replace the original exception. */ }
     }
 }

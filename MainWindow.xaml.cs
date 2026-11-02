@@ -1,47 +1,26 @@
-﻿using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
-using System.Diagnostics;
-using System.Drawing;
-using System.Windows;
-using System.Windows.Controls;
-using System.Windows.Input;
-using System.Windows.Media;
-using System.Windows.Threading;
+using System.Globalization;
+using System.Runtime.InteropServices;
 using HpPowerSwitcher.Services;
+using Microsoft.UI;
+using Microsoft.UI.Dispatching;
+using Microsoft.UI.Windowing;
+using Microsoft.UI.Xaml;
+using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Media;
 
 namespace HpPowerSwitcher;
 
 public static class BrushCache
 {
-    private static readonly ConcurrentDictionary<string, SolidColorBrush> HexBrushes = new(StringComparer.OrdinalIgnoreCase);
-
-    public static readonly SolidColorBrush RunningDot = CreateFrozen(34, 197, 94);
-    public static readonly SolidColorBrush StoppedDot = CreateFrozen(100, 116, 139);
-    public static readonly SolidColorBrush RunningBadgeBg = CreateFrozen(19, 47, 38);
-    public static readonly SolidColorBrush StoppedBadgeBg = CreateFrozen(30, 41, 59);
-    public static readonly SolidColorBrush RunningBadgeFg = CreateFrozen(134, 239, 172);
-    public static readonly SolidColorBrush StoppedBadgeFg = CreateFrozen(148, 163, 184);
-    public static readonly SolidColorBrush ActiveCardBg = CreateFrozen(23, 37, 64);
-    public static readonly SolidColorBrush InactiveCardBg = FromHex("#131C31");
-    public static readonly SolidColorBrush HoverCardBg = FromHex("#1A2642");
-    public static readonly SolidColorBrush InactiveCardBorder = FromHex("#1E293B");
-
+    private static readonly Dictionary<string, SolidColorBrush> Brushes = new(StringComparer.OrdinalIgnoreCase);
     public static SolidColorBrush FromHex(string hex)
     {
-        return HexBrushes.GetOrAdd(hex, static h =>
-        {
-            var c = (System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString(h);
-            var b = new SolidColorBrush(c);
-            b.Freeze();
-            return b;
-        });
-    }
-
-    private static SolidColorBrush CreateFrozen(byte r, byte g, byte b)
-    {
-        var brush = new SolidColorBrush(System.Windows.Media.Color.FromRgb(r, g, b));
-        brush.Freeze();
+        if (Brushes.TryGetValue(hex, out var brush)) return brush;
+        uint rgb = uint.Parse(hex.TrimStart('#'), NumberStyles.HexNumber, CultureInfo.InvariantCulture);
+        brush = new SolidColorBrush(Windows.UI.Color.FromArgb(255, (byte)(rgb >> 16), (byte)(rgb >> 8), (byte)rgb));
+        Brushes.Add(hex, brush);
         return brush;
     }
 }
@@ -49,720 +28,360 @@ public static class BrushCache
 public sealed class HpComponentRowViewModel : INotifyPropertyChanged
 {
     public event PropertyChangedEventHandler? PropertyChanged;
-
-    public HpComponentStatus Model { get; private set; } = null!;
-    public string Id => Model.Id;
+    public HpComponentStatus Model { get; private set; }
+    private bool _busy;
     public string DisplayName => Model.DisplayName;
-    public string Description => string.IsNullOrEmpty(Model.CpuDisplay)
-        ? Model.Description
-        : $"{Model.Description} ({Model.CpuDisplay})";
+    public string Description => Model.Description;
     public string CategoryBadge => Model.CategoryBadge;
-    public string MemoryDisplay => Model.MemoryDisplay;
-    public string StartModeText => Model.StartModeText;
-    public string StateText => Model.StateText;
-    public bool CanActivate => Model.CanActivate;
-    public bool CanDeactivate => Model.CanDeactivate;
-
-    private string? _busyActivateText;
-    private string? _busyDeactivateText;
-
-    public string ActivateButtonText => _busyActivateText ?? (Model.Kind is HpComponentKind.UwpBackgroundWatchdog
-        or HpComponentKind.ScheduledTaskWatchdog
-        or HpComponentKind.RegistryRunWatchdog
-        ? "Enable"
-        : "Activate");
-
-    public string DeactivateButtonText => _busyDeactivateText ?? (Model.Kind is HpComponentKind.UwpBackgroundWatchdog
-        or HpComponentKind.ScheduledTaskWatchdog
-        or HpComponentKind.RegistryRunWatchdog
-        ? "Block & Disable"
-        : "Stop & Disable");
-
-    public SolidColorBrush StatusDotBrush { get; private set; } = null!;
-    public SolidColorBrush CategoryBrush { get; private set; } = null!;
-    public SolidColorBrush StateBadgeBg { get; private set; } = null!;
-    public SolidColorBrush StateBadgeFg { get; private set; } = null!;
-
+    public SolidColorBrush CategoryBrush { get; }
+    public string StatusDisplay => $"{Model.StateText} · {Model.StartModeText} · {Model.MemoryDisplay}" +
+        (string.IsNullOrEmpty(Model.CpuDisplay) ? "" : $" · {Model.CpuDisplay}");
+    private bool IsWatchdog => Model.Kind is HpComponentKind.UwpBackgroundWatchdog
+        or HpComponentKind.ScheduledTaskWatchdog or HpComponentKind.RegistryRunWatchdog;
+    public string ActivateText => _busy ? "Working…" : IsWatchdog ? "Enable" : "Activate";
+    public string DeactivateText => _busy ? "Working…" : IsWatchdog ? "Block & disable" : "Stop & disable";
+    public bool CanActivate => !_busy && Model.CanActivate;
+    public bool CanDeactivate => !_busy && Model.CanDeactivate;
     public HpComponentRowViewModel(HpComponentStatus model)
     {
-        UpdateFrom(model);
-    }
-
-    public void UpdateFrom(HpComponentStatus model)
-    {
         Model = model;
-        _busyActivateText = null;
-        _busyDeactivateText = null;
-        StatusDotBrush = model.IsRunning ? BrushCache.RunningDot : BrushCache.StoppedDot;
         CategoryBrush = BrushCache.FromHex(model.CategoryColorHex);
-        StateBadgeBg = model.IsRunning ? BrushCache.RunningBadgeBg : BrushCache.StoppedBadgeBg;
-        StateBadgeFg = model.IsRunning ? BrushCache.RunningBadgeFg : BrushCache.StoppedBadgeFg;
-
-        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(string.Empty));
     }
-
-    public void SetBusyState(bool isActivating)
+    public void Update(HpComponentStatus model)
     {
-        if (isActivating)
-            _busyActivateText = "⏳ Starting...";
-        else
-            _busyDeactivateText = "⏳ Stopping...";
-
-        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(ActivateButtonText)));
-        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(DeactivateButtonText)));
+        if (Model == model) return;
+        Model = model;
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(null));
+    }
+    public void SetBusy(bool busy)
+    {
+        _busy = busy;
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(null));
     }
 }
 
 public partial class MainWindow : Window
 {
-    private sealed record CardVisualRefs(
-        Border CardBorder,
-        TextBlock TitleBlock,
-        Border ActiveBadge,
-        SolidColorBrush AccentBrush);
-
     private readonly HpPowerService _powerService = new();
     private readonly HpBloatManagerService _bloatService = new();
-    private readonly DispatcherTimer _refreshTimer;
-    private readonly SemaphoreSlim _refreshGate = new(1, 1);
-    private readonly Dictionary<HpThermalMode, CardVisualRefs> _cardVisuals = [];
-    private readonly ObservableCollection<HpComponentRowViewModel> _componentRows = [];
+    private readonly SemaphoreSlim _dataGate = new(1, 1);
+    private readonly ObservableCollection<HpComponentRowViewModel> _rows = [];
     private readonly Dictionary<string, HpComponentRowViewModel> _rowLookup = new(StringComparer.OrdinalIgnoreCase);
-
-    private System.Windows.Forms.NotifyIcon? _trayIcon;
-    private HpThermalMode? _selectedBiosMode;
-    private bool _isExiting;
-    private bool _isActionBusy;
-    private bool _isSidebarExpanded = true;
+    private readonly Dictionary<HpThermalMode, Button> _modeButtons = [];
+    private readonly Dictionary<HpThermalMode, Border> _modeBadges = [];
+    private readonly DispatcherQueueTimer _refreshTimer;
+    private Services.TrayIcon? _tray;
+    private string _page = "Profiles";
+    private bool _ready, _closing, _allowClose, _actionBusy;
+    private SystemPowerSnapshot? _snapshot;
 
     public MainWindow()
     {
         InitializeComponent();
-        InitializeSensors();
-        ListComponents.ItemsSource = _componentRows;
-        InitializeTrayIcon();
-
-        _refreshTimer = new DispatcherTimer
+        ExtendsContentIntoTitleBar = true;
+        SetTitleBar(AppTitleBar);
+        AppWindow.TitleBar.ButtonBackgroundColor = Microsoft.UI.Colors.Transparent;
+        AppWindow.TitleBar.ButtonInactiveBackgroundColor = Microsoft.UI.Colors.Transparent;
+        AppWindow.TitleBar.ButtonForegroundColor = Windows.UI.Color.FromArgb(255, 166, 188, 207);
+        AppWindow.TitleBar.ButtonHoverBackgroundColor = Windows.UI.Color.FromArgb(255, 35, 56, 73);
+        GridThermalCards.SizeChanged += (_, _) => UpdateProfileLayout();
+        double scale = GetDpiForWindow(WinRT.Interop.WindowNative.GetWindowHandle(this)) / 96.0;
+        var workArea = DisplayArea.GetFromWindowId(AppWindow.Id, DisplayAreaFallback.Nearest).WorkArea;
+        AppWindow.Resize(new Windows.Graphics.SizeInt32(
+            Math.Min((int)(1060 * scale), (int)(workArea.Width * 0.95)),
+            Math.Min((int)(790 * scale), (int)(workArea.Height * 0.95))));
+        AppWindow.SetIcon(Path.Combine(AppContext.BaseDirectory, "Assets", "app.ico"));
+        ListComponents.ItemsSource = _rows;
+        _refreshTimer = DispatcherQueue.CreateTimer();
+        _refreshTimer.Interval = TimeSpan.FromSeconds(8);
+        _refreshTimer.Tick += async (_, _) => await RefreshAsync();
+        AppWindow.Changed += (_, _) => UpdatePolling();
+        AppWindow.Closing += Window_Closing;
+        RootGrid.Loaded += async (_, _) =>
         {
-            Interval = TimeSpan.FromSeconds(4)
+            if (_ready) return;
+            _ready = true;
+            Navigation.SelectedItem = Navigation.MenuItems[0];
+            try
+            {
+                _tray = new Services.TrayIcon(WinRT.Interop.WindowNative.GetWindowHandle(this),
+                    Path.Combine(AppContext.BaseDirectory, "Assets", "app.ico"), ShowMainWindow,
+                    async mode => await RunActionAsync(async () =>
+                        (await _powerService.SetHpThermalModeAsync(mode, ChkSyncWinOverlay.IsChecked == true)).Message),
+                    async () => await DisableBloatAsync(), () => { _allowClose = false; _exitRequested = true; Close(); });
+            }
+            catch (Exception ex) { TxtStatusBar.Text = $"Tray unavailable: {ex.Message}"; }
+            await RefreshAsync();
+            UpdatePolling();
         };
-        _refreshTimer.Tick += async (_, _) =>
-        {
-            // Skip polling while hidden to tray or minimized to save CPU/WMI overhead
-            if (!IsVisible || WindowState == WindowState.Minimized || _isActionBusy)
-                return;
-
-            await RefreshAllDataAsync(updateStatusBar: false);
-        };
-
-        Loaded += async (_, _) =>
-        {
-            await RefreshAllDataAsync(updateStatusBar: true, showVisualLoading: true, loadingText: "Loading...");
-            _refreshTimer.Start();
-        };
-
-        StateChanged += MainWindow_StateChanged;
-        Closing += MainWindow_Closing;
     }
 
-    private void MainWindow_StateChanged(object? sender, EventArgs e)
+    private bool _exitRequested;
+    [DllImport("user32.dll")]
+    private static extern uint GetDpiForWindow(IntPtr window);
+    private bool WindowVisible => AppWindow.IsVisible && !_closing &&
+        (AppWindow.Presenter is not OverlappedPresenter presenter || presenter.State != OverlappedPresenterState.Minimized);
+
+    private void UpdatePolling()
     {
-        if (WindowState == WindowState.Maximized)
-        {
-            BtnTitleMaximize.Content = "🗗";
-            BtnTitleMaximize.ToolTip = "Restore Down";
-            var borderThickness = SystemParameters.WindowResizeBorderThickness;
-            RootGrid.Margin = new Thickness(borderThickness.Left, borderThickness.Top, borderThickness.Right, borderThickness.Bottom);
-        }
-        else
-        {
-            BtnTitleMaximize.Content = "🗖";
-            BtnTitleMaximize.ToolTip = "Maximize";
-            RootGrid.Margin = new Thickness(0);
-        }
+        if (!_ready) return;
+        if (WindowVisible && !_actionBusy && _page != "Sensors") _refreshTimer.Start();
+        else _refreshTimer.Stop();
+        UpdateSensorPolling();
     }
 
-    private void BtnTitleMinimize_Click(object sender, RoutedEventArgs e) =>
-        WindowState = WindowState.Minimized;
-
-    private void BtnTitleMaximize_Click(object sender, RoutedEventArgs e) =>
-        WindowState = WindowState == WindowState.Maximized ? WindowState.Normal : WindowState.Maximized;
-
-    private void BtnTitleClose_Click(object sender, RoutedEventArgs e) =>
-        Close();
-
-    private void BtnToggleSidebar_Click(object sender, RoutedEventArgs e) =>
-        SetSidebarExpanded(!_isSidebarExpanded);
-
-    private void SetSidebarExpanded(bool expanded)
+    private async void Navigation_SelectionChanged(NavigationView sender, NavigationViewSelectionChangedEventArgs args)
     {
-        _isSidebarExpanded = expanded;
-        ColSidebar.Width = new GridLength(expanded ? 210 : 54);
-        TxtToggleLabel.Visibility = expanded ? Visibility.Visible : Visibility.Collapsed;
-        PanelNavProfiles.Visibility = expanded ? Visibility.Visible : Visibility.Collapsed;
-        PanelNavServices.Visibility = expanded ? Visibility.Visible : Visibility.Collapsed;
-        PanelNavSensors.Visibility = expanded ? Visibility.Visible : Visibility.Collapsed;
-
-        RadioNavProfiles.ToolTip = expanded ? null : "Profiles & Power Modes";
-        RadioNavServices.ToolTip = expanded ? null : "HP Services & Watchdogs";
-        RadioNavSensors.ToolTip = expanded ? null : "Live Sensors & Heat";
-        BtnToggleSidebar.ToolTip = expanded ? "Collapse navigation" : "Expand navigation";
+        if (args.SelectedItem is not NavigationViewItem { Tag: string page }) return;
+        _page = page;
+        TxtPageEyebrow.Text = page == "Profiles" ? "DEVICE CONTROL / POWER" : page == "Services" ? "DEVICE CONTROL / BACKGROUND" : "DEVICE CONTROL / TELEMETRY";
+        TxtPageTitle.Text = page == "Profiles" ? "Power & performance" : page == "Services" ? "Keep the essentials." : "Your device, in detail.";
+        TxtPageDescription.Text = page == "Profiles" ? "Find your balance. Make every charge count." : page == "Services" ? "Take control of what runs behind the scenes." : "A live look at performance, temperature, and power.";
+        ProfilesView.Visibility = page == "Profiles" ? Visibility.Visible : Visibility.Collapsed;
+        ServicesView.Visibility = page == "Services" ? Visibility.Visible : Visibility.Collapsed;
+        SensorHost.Visibility = page == "Sensors" ? Visibility.Visible : Visibility.Collapsed;
+        if (page == "Sensors") EnsureSensorPage();
+        UpdatePolling();
+        if (_ready && page != "Sensors") await RefreshAsync();
     }
 
-    private void NavRadio_Checked(object sender, RoutedEventArgs e)
+    // Only the visible page queries its data. A single gate serializes polling and all mutations.
+    private async Task RefreshAsync()
     {
-        if (MainTabControl == null) return;
-
-        if (ReferenceEquals(sender, RadioNavProfiles))
-            MainTabControl.SelectedIndex = 0;
-        else if (ReferenceEquals(sender, RadioNavServices))
-            MainTabControl.SelectedIndex = 1;
-        else if (ReferenceEquals(sender, RadioNavSensors))
-            MainTabControl.SelectedIndex = 2;
-
-        UpdateSensorTimerState();
+        if (!WindowVisible || _actionBusy || !await _dataGate.WaitAsync(0)) return;
+        try { await RefreshCoreAsync(); }
+        catch (Exception ex) { if (!_closing) TxtStatusBar.Text = $"Refresh error: {ex.Message}"; }
+        finally { _dataGate.Release(); }
     }
 
-    private async Task RefreshAllDataAsync(bool updateStatusBar, bool showVisualLoading = false, string loadingText = "Refreshing...")
+    private async Task RefreshCoreAsync(bool refreshServices = false)
     {
-        if (!await _refreshGate.WaitAsync(0))
-            return;
-
-        if (showVisualLoading)
-            SetLoadingIndicator(true, loadingText);
-
-        try
+        string page = _page;
+        if (page == "Profiles" || _snapshot == null)
         {
-            var sw = showVisualLoading ? Stopwatch.StartNew() : null;
-
-            // Run both hardware snapshot and service/process queries concurrently in the background
-            var snapTask = _powerService.GetSnapshotAsync();
-            var statusesTask = _bloatService.GetAllStatusesAsync();
-
-            await Task.WhenAll(snapTask, statusesTask);
-
-            // Ensure manual/action refreshes remain visible for at least 220ms so the spinner doesn't flash for 1 frame
-            if (sw != null && sw.ElapsedMilliseconds < 220)
-                await Task.Delay(220 - (int)sw.ElapsedMilliseconds);
-
-            var snap = await snapTask;
-            var statuses = await statusesTask;
-
-            if (snap.CurrentBiosMode.HasValue)
-                _selectedBiosMode = snap.CurrentBiosMode;
-
+            var snap = await _powerService.GetSnapshotAsync();
+            if (_closing) return;
+            _snapshot = snap;
             TxtModelName.Text = snap.ModelName;
-            TxtBiosInfo.Text = $"BIOS: {snap.BiosVersion}  •  AC Overlay: {HpPowerService.FormatOverlayName(snap.AcOverlayMode)}  •  Battery Overlay: {HpPowerService.FormatOverlayName(snap.DcOverlayMode)}";
-
-            if (snap.IsAdmin)
-            {
-                BadgeAdmin.Background = BrushCache.FromHex("#14532D");
-                TxtAdminBadge.Text = "ADMIN • BIOS WMI READY";
-                TxtAdminBadge.Foreground = BrushCache.FromHex("#86EFAC");
-                BtnElevate.Visibility = Visibility.Collapsed;
-            }
-            else
-            {
-                BadgeAdmin.Background = BrushCache.FromHex("#7C2D12");
-                TxtAdminBadge.Text = "LIMITED (NON-ADMIN)";
-                TxtAdminBadge.Foreground = BrushCache.FromHex("#FDBA74");
-                BtnElevate.Visibility = Visibility.Visible;
-            }
-
-            TxtActiveThermalIndicator.Text = _selectedBiosMode?.ToString() ?? "Unknown";
+            TxtBiosInfo.Text = $"BIOS {snap.BiosVersion} · AC: {HpPowerService.FormatOverlayName(snap.AcOverlayMode)} · Battery: {HpPowerService.FormatOverlayName(snap.DcOverlayMode)}";
+            TxtAdminBadge.Text = snap.IsAdmin ? "Administrator" : "Limited access";
             TxtBatteryIndicator.Text = snap.BatteryStatusText;
-
-            UpdateOrBuildThermalModeCards(snap);
-            UpdateWindowsPowerButtons(snap);
-            ApplyStatusesToUi(statuses);
-
-            OverlayInitialLoading.Visibility = Visibility.Collapsed;
-
-            if (updateStatusBar)
-                TxtStatusBar.Text = snap.StatusMessage;
+            TxtActiveThermalIndicator.Text = snap.CurrentBiosMode?.ToString() ?? "Unavailable";
+            UpdatePowerControls(snap);
+            TxtStatusBar.Text = snap.StatusMessage;
         }
-        catch (Exception ex)
-        {
-            TxtStatusBar.Text = $"Refresh error: {ex.Message}";
-        }
-        finally
-        {
-            if (showVisualLoading && !_isActionBusy)
-                SetLoadingIndicator(false);
-
-            _refreshGate.Release();
-        }
-    }
-
-    private void SetLoadingIndicator(bool isLoading, string? badgeText = null)
-    {
-        if (isLoading)
-        {
-            if (!string.IsNullOrEmpty(badgeText))
-                TxtRefreshBadge.Text = badgeText;
-            BadgeRefreshing.Visibility = Visibility.Visible;
-            BarLoading.Visibility = Visibility.Visible;
-        }
-        else
-        {
-            BadgeRefreshing.Visibility = Visibility.Collapsed;
-            BarLoading.Visibility = Visibility.Collapsed;
-        }
-    }
-
-    private void UpdateOrBuildThermalModeCards(SystemPowerSnapshot snap)
-    {
-        var options = HpPowerService.GetAllModeOptions(snap.SupportedBiosModes);
-
-        // Build cards only once so hover states and clicks never flicker during background refreshes
-        if (_cardVisuals.Count == 0)
-        {
-            GridThermalCards.Children.Clear();
-            foreach (var opt in options)
-            {
-                var accentBrush = BrushCache.FromHex(opt.AccentHex);
-
-                var cardBorder = new Border
-                {
-                    Background = BrushCache.InactiveCardBg,
-                    BorderBrush = BrushCache.InactiveCardBorder,
-                    BorderThickness = new Thickness(1),
-                    CornerRadius = new CornerRadius(10),
-                    Padding = new Thickness(14, 11, 14, 11),
-                    Margin = new Thickness(4),
-                    Cursor = System.Windows.Input.Cursors.Hand,
-                    Tag = opt.Mode
-                };
-
-                cardBorder.MouseEnter += (s, _) =>
-                {
-                    if (s is Border b && (HpThermalMode)b.Tag != _selectedBiosMode)
-                        b.Background = BrushCache.HoverCardBg;
-                };
-                cardBorder.MouseLeave += (s, _) =>
-                {
-                    if (s is Border b && (HpThermalMode)b.Tag != _selectedBiosMode)
-                        b.Background = BrushCache.InactiveCardBg;
-                };
-                cardBorder.MouseLeftButtonUp += ThermalCard_Click;
-
-                var stack = new StackPanel();
-                var topGrid = new Grid();
-                topGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-                topGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-
-                var titlePanel = new StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal, VerticalAlignment = VerticalAlignment.Center };
-                titlePanel.Children.Add(new TextBlock
-                {
-                    Text = opt.IconGlyph,
-                    FontSize = 16,
-                    Margin = new Thickness(0, 0, 8, 0),
-                    VerticalAlignment = VerticalAlignment.Center
-                });
-                var titleBlock = new TextBlock
-                {
-                    Text = opt.Title,
-                    FontSize = 14.5,
-                    FontWeight = FontWeights.Bold,
-                    Foreground = System.Windows.Media.Brushes.White,
-                    VerticalAlignment = VerticalAlignment.Center
-                };
-                titlePanel.Children.Add(titleBlock);
-                Grid.SetColumn(titlePanel, 0);
-                topGrid.Children.Add(titlePanel);
-
-                var activeBadge = new Border
-                {
-                    Background = accentBrush,
-                    CornerRadius = new CornerRadius(4),
-                    Padding = new Thickness(6, 1, 6, 1),
-                    VerticalAlignment = VerticalAlignment.Center,
-                    Visibility = Visibility.Collapsed,
-                    Child = new TextBlock
-                    {
-                        Text = "ACTIVE",
-                        FontSize = 10,
-                        FontWeight = FontWeights.Bold,
-                        Foreground = BrushCache.FromHex("#0B1120")
-                    }
-                };
-                Grid.SetColumn(activeBadge, 1);
-                topGrid.Children.Add(activeBadge);
-
-                stack.Children.Add(topGrid);
-                stack.Children.Add(new TextBlock
-                {
-                    Text = opt.Subtitle,
-                    FontSize = 11.5,
-                    Foreground = BrushCache.FromHex("#94A3B8"),
-                    TextWrapping = TextWrapping.Wrap,
-                    Margin = new Thickness(0, 5, 0, 0)
-                });
-
-                cardBorder.Child = stack;
-                GridThermalCards.Children.Add(cardBorder);
-                _cardVisuals[opt.Mode] = new CardVisualRefs(cardBorder, titleBlock, activeBadge, accentBrush);
-            }
-        }
-
-        // Update visual state in-place without recreating controls
-        foreach (var opt in options)
-        {
-            if (!_cardVisuals.TryGetValue(opt.Mode, out var refs))
-                continue;
-
-            bool isActive = _selectedBiosMode == opt.Mode;
-            refs.CardBorder.Opacity = opt.IsSupported ? 1.0 : 0.55;
-            refs.CardBorder.BorderBrush = isActive ? refs.AccentBrush : BrushCache.InactiveCardBorder;
-            refs.CardBorder.BorderThickness = new Thickness(isActive ? 2 : 1);
-            refs.CardBorder.Background = isActive
-                ? BrushCache.ActiveCardBg
-                : (refs.CardBorder.IsMouseOver ? BrushCache.HoverCardBg : BrushCache.InactiveCardBg);
-            refs.TitleBlock.Foreground = isActive ? refs.AccentBrush : System.Windows.Media.Brushes.White;
-            refs.ActiveBadge.Visibility = isActive ? Visibility.Visible : Visibility.Collapsed;
-        }
-    }
-
-    private void UpdateWindowsPowerButtons(SystemPowerSnapshot snap)
-    {
-        var activeOverlay = snap.IsOnAcPower ? snap.AcOverlayMode : snap.DcOverlayMode;
-        TxtWinOverlaySub.Text = snap.IsOnAcPower
-            ? $"Current (Plugged In): {HpPowerService.FormatOverlayName(activeOverlay)}"
-            : $"Current (On Battery): {HpPowerService.FormatOverlayName(activeOverlay)}";
-
-        HighlightOverlayButton(BtnWinEco, activeOverlay == WindowsOverlayPowerMode.BestPowerEfficiency, "#4ADE80");
-        HighlightOverlayButton(BtnWinBalanced, activeOverlay == WindowsOverlayPowerMode.Balanced, "#38BDF8");
-        HighlightOverlayButton(BtnWinPerf, activeOverlay == WindowsOverlayPowerMode.BestPerformance, "#F97316");
-    }
-
-    private static void HighlightOverlayButton(System.Windows.Controls.Button btn, bool isSelected, string accentHex)
-    {
-        if (isSelected)
-        {
-            btn.Background = BrushCache.FromHex("#1E293B");
-            btn.BorderBrush = BrushCache.FromHex(accentHex);
-            btn.BorderThickness = new Thickness(1.5);
-            btn.Foreground = BrushCache.FromHex(accentHex);
-        }
-        else
-        {
-            btn.Background = BrushCache.FromHex("#0F172A");
-            btn.BorderBrush = BrushCache.FromHex("#334155");
-            btn.BorderThickness = new Thickness(1);
-            btn.Foreground = BrushCache.FromHex("#E2E8F0");
-        }
-    }
-
-    private async Task RefreshServicesAndProcessesAsync()
-    {
-        await _refreshGate.WaitAsync();
-        try
+        if (page == "Services" || refreshServices)
         {
             var statuses = await _bloatService.GetAllStatusesAsync();
-            ApplyStatusesToUi(statuses);
-        }
-        finally
-        {
-            _refreshGate.Release();
+            if (_closing) return;
+            ApplyStatuses(statuses);
         }
     }
 
-    private void ApplyStatusesToUi(IReadOnlyList<HpComponentStatus> statuses)
+    private void UpdatePowerControls(SystemPowerSnapshot snap)
     {
-        var procAndServiceItems = statuses
-            .Where(s => s.Kind is HpComponentKind.WindowsService or HpComponentKind.ProcessGroup)
-            .ToList();
+        if (_modeButtons.Count == 0)
+        {
+            int index = 0;
+            int columns = GridThermalCards.ColumnDefinitions.Count;
+            foreach (var option in HpPowerService.GetAllModeOptions(snap.SupportedBiosModes))
+            {
+                var (glyph, color, description) = option.Mode switch
+                {
+                    HpThermalMode.SmartSense => ("\uE945", "#86E8CB", "Automatically adapts to your workload."),
+                    HpThermalMode.Balanced => ("\uE9D9", "#A9BCFF", "Everyday speed. Comfortable thermals."),
+                    HpThermalMode.Performance => ("\uE7C1", "#FFB98C", "More power for demanding work."),
+                    HpThermalMode.Cool => ("\uE9CA", "#8ACFFF", "Lower temperatures. Cooler surfaces."),
+                    HpThermalMode.Quiet => ("\uE74F", "#C8ABF5", "Less fan noise. Fewer distractions."),
+                    _ => ("\uE83E", "#BDD895", "A little less power. More battery life.")
+                };
+                var stack = new StackPanel { Spacing = 8 };
+                var top = new Grid { Margin = new Thickness(0, 0, 0, 4) };
+                var icon = new Border
+                {
+                    Width = 36, Height = 36, CornerRadius = new CornerRadius(11),
+                    Background = BrushCache.FromHex("#20313F"), HorizontalAlignment = HorizontalAlignment.Left,
+                    Child = new FontIcon { Glyph = glyph, FontSize = 18, Foreground = BrushCache.FromHex(color) }
+                };
+                var badge = new Border
+                {
+                    HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Top,
+                    Background = BrushCache.FromHex("#244B48"), CornerRadius = new CornerRadius(5),
+                    Padding = new Thickness(6, 3, 6, 3), Visibility = Visibility.Collapsed,
+                    Child = new TextBlock { Text = "ACTIVE", FontSize = 8, CharacterSpacing = 90,
+                        FontWeight = Microsoft.UI.Text.FontWeights.SemiBold, Foreground = BrushCache.FromHex("#A2F3D9") }
+                };
+                top.Children.Add(icon); top.Children.Add(badge);
+                _modeBadges[option.Mode] = badge;
+                stack.Children.Add(top);
+                stack.Children.Add(new TextBlock { Text = option.Title, FontSize = 16, FontWeight = Microsoft.UI.Text.FontWeights.SemiBold });
+                stack.Children.Add(new TextBlock { Text = description, FontSize = 12, TextWrapping = TextWrapping.Wrap,
+                    Foreground = BrushCache.FromHex("#99AFC2"), MinHeight = 34 });
+                var button = new Button
+                {
+                    Content = stack, Tag = option.Mode, Style = (Style)Application.Current.Resources["ProfileCardStyle"],
+                    IsEnabled = option.IsSupported
+                };
+                Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(button, option.Title);
+                ToolTipService.SetToolTip(button, option.IsSupported ? option.Subtitle : "Not reported as supported by this BIOS");
+                button.Click += async (sender, _) =>
+                {
+                    if (sender is Button { Tag: HpThermalMode mode })
+                        await RunActionAsync(async () =>
+                            (await _powerService.SetHpThermalModeAsync(mode, ChkSyncWinOverlay.IsChecked == true)).Message);
+                };
+                if (index % columns == 0) GridThermalCards.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                Grid.SetColumn(button, index % columns);
+                Grid.SetRow(button, index++ / columns);
+                GridThermalCards.Children.Add(button);
+                _modeButtons[option.Mode] = button;
+            }
+        }
+        foreach (var (mode, button) in _modeButtons)
+        {
+            bool selected = mode == snap.CurrentBiosMode;
+            button.BorderBrush = BrushCache.FromHex(selected ? "#86E8CB" : "#263747");
+            button.Background = BrushCache.FromHex(selected ? "#17343B" : "#121E2B");
+            _modeBadges[mode].Visibility = selected ? Visibility.Visible : Visibility.Collapsed;
+        }
+        var active = snap.IsOnAcPower ? snap.AcOverlayMode : snap.DcOverlayMode;
+        TxtWinOverlaySub.Text = $"{(snap.IsOnAcPower ? "Plugged in" : "On battery")} · {HpPowerService.FormatOverlayName(active)}";
+        StyleOverlay(BtnWinEco, active == WindowsOverlayPowerMode.BestPowerEfficiency);
+        StyleOverlay(BtnWinBalanced, active == WindowsOverlayPowerMode.Balanced);
+        StyleOverlay(BtnWinPerf, active == WindowsOverlayPowerMode.BestPerformance);
+    }
 
-        double totalRamMb = procAndServiceItems.Where(s => s.IsRunning).Sum(s => s.MemoryMb);
-        int runningCount = procAndServiceItems.Count(s => s.IsRunning);
+    private static void StyleOverlay(Button button, bool selected)
+    {
+        button.Background = BrushCache.FromHex(selected ? "#21423F" : "#0D1824");
+        button.BorderBrush = BrushCache.FromHex(selected ? "#71BCA8" : "#293D4F");
+        button.Foreground = BrushCache.FromHex(selected ? "#A6F3DC" : "#9FB4C6");
+    }
 
-        TxtHpRamIndicator.Text = $"{totalRamMb:F1} MB ({runningCount} active)";
-        TxtHpRamIndicator.Foreground = totalRamMb > 250
-            ? BrushCache.FromHex("#F87171")
-            : (totalRamMb > 100 ? BrushCache.FromHex("#FBBF24") : BrushCache.FromHex("#4ADE80"));
-
-        int bloatRunning = statuses.Count(s =>
-            s.IsRunning && s.Category is HpSafetyCategory.AutoLauncherWatchdog
-                or HpSafetyCategory.TelemetryAndBloat
-                or HpSafetyCategory.RedundantBackground);
-
-        TxtServiceSummary.Text = bloatRunning > 0
-            ? $"• {bloatRunning} watchdog/bloat item(s) currently active"
-            : "• All respawn watchdogs, telemetry & bloat disabled";
-
-        // Update existing rows in-place so items never flicker or disappear during refreshes
+    private void UpdateProfileLayout()
+    {
+        int columns = GridThermalCards.ActualWidth >= 680 ? 3 : GridThermalCards.ActualWidth >= 390 ? 2 : 1;
+        if (GridThermalCards.ColumnDefinitions.Count == columns) return;
+        GridThermalCards.ColumnDefinitions.Clear();
+        for (int i = 0; i < columns; i++) GridThermalCards.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        GridThermalCards.RowDefinitions.Clear();
+        for (int i = 0; i < GridThermalCards.Children.Count; i++)
+        {
+            if (i % columns == 0) GridThermalCards.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            Grid.SetColumn((FrameworkElement)GridThermalCards.Children[i], i % columns);
+            Grid.SetRow((FrameworkElement)GridThermalCards.Children[i], i / columns);
+        }
+    }
+    private void ApplyStatuses(IReadOnlyList<HpComponentStatus> statuses)
+    {
+        double memory = 0;
+        int active = 0;
+        var present = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var status in statuses)
         {
-            if (_rowLookup.TryGetValue(status.Id, out var existingRow))
-            {
-                existingRow.UpdateFrom(status);
-            }
-            else
-            {
-                var newRow = new HpComponentRowViewModel(status);
-                _rowLookup[status.Id] = newRow;
-                _componentRows.Add(newRow);
-            }
+            present.Add(status.Id);
+            if (status.Kind is HpComponentKind.WindowsService or HpComponentKind.ProcessGroup && status.IsRunning)
+            { memory += status.MemoryMb; active++; }
+            if (_rowLookup.TryGetValue(status.Id, out var row)) row.Update(status);
+            else { row = new HpComponentRowViewModel(status); _rowLookup.Add(status.Id, row); _rows.Add(row); }
         }
+        for (int i = _rows.Count - 1; i >= 0; i--)
+            if (!present.Contains(_rows[i].Model.Id)) { _rowLookup.Remove(_rows[i].Model.Id); _rows.RemoveAt(i); }
+        TxtServiceSummary.Text = $"HP processes and services: {memory:F1} MB · {active} active";
     }
 
-    private async void ThermalCard_Click(object sender, MouseButtonEventArgs e)
+    private async Task RunActionAsync(Func<Task<string>> action, bool services = false)
     {
-        if (sender is Border { Tag: HpThermalMode mode })
-        {
-            await ApplyThermalModeAsync(mode);
-        }
-    }
-
-    private async Task ApplyThermalModeAsync(HpThermalMode mode)
-    {
-        if (_isActionBusy) return;
-        _isActionBusy = true;
-        SetLoadingIndicator(true, $"Switching to {mode}...");
-
+        if (_actionBusy || _closing) return;
+        _actionBusy = true;
+        UpdatePolling();
+        BarLoading.Visibility = Visibility.Visible;
+        BarLoading.IsIndeterminate = true;
+        Navigation.IsEnabled = false;
+        BtnRefresh.IsEnabled = false;
+        await _dataGate.WaitAsync();
         try
         {
-            // Optimistically highlight selected mode immediately for instant UI feedback
-            var prevMode = _selectedBiosMode;
-            _selectedBiosMode = mode;
-            TxtActiveThermalIndicator.Text = mode.ToString();
-            TxtStatusBar.Text = $"Switching HP BIOS thermal profile to {mode}...";
-
-            bool syncWin = ChkSyncWinOverlay.IsChecked == true;
-            var (ok, msg, _) = await _powerService.SetHpThermalModeAsync(mode, syncWin);
-            if (!ok)
-                _selectedBiosMode = prevMode;
-
-            await RefreshAllDataAsync(updateStatusBar: false, showVisualLoading: true, loadingText: "Syncing BIOS...");
-            TxtStatusBar.Text = msg;
+            if (_closing) return;
+            string message = await action();
+            await RefreshCoreAsync(services);
+            if (!_closing) TxtStatusBar.Text = message;
         }
+        catch (Exception ex) { if (!_closing) TxtStatusBar.Text = $"Action failed: {ex.Message}"; }
         finally
         {
-            _isActionBusy = false;
-            SetLoadingIndicator(false);
+            _dataGate.Release();
+            _actionBusy = false;
+            if (!_closing)
+            {
+                Navigation.IsEnabled = true;
+                BtnRefresh.IsEnabled = true;
+                BarLoading.IsIndeterminate = false;
+                BarLoading.Visibility = Visibility.Collapsed;
+                UpdatePolling();
+            }
         }
     }
 
-    private async void BtnWinEco_Click(object sender, RoutedEventArgs e) =>
-        await ApplyWindowsOverlayAsync(WindowsOverlayPowerMode.BestPowerEfficiency);
-
-    private async void BtnWinBalanced_Click(object sender, RoutedEventArgs e) =>
-        await ApplyWindowsOverlayAsync(WindowsOverlayPowerMode.Balanced);
-
-    private async void BtnWinPerf_Click(object sender, RoutedEventArgs e) =>
-        await ApplyWindowsOverlayAsync(WindowsOverlayPowerMode.BestPerformance);
-
-    private async Task ApplyWindowsOverlayAsync(WindowsOverlayPowerMode mode)
+    private async void Overlay_Click(object sender, RoutedEventArgs e)
     {
-        if (_isActionBusy) return;
-        _isActionBusy = true;
-        SetLoadingIndicator(true, "Updating Power Mode...");
-
+        if (sender is not Button { Tag: string tag } || !Enum.TryParse<WindowsOverlayPowerMode>(tag, out var mode)) return;
+        bool both = ChkApplyBothAcDc.IsChecked == true;
+        await RunActionAsync(async () =>
+        {
+            bool ac = PowerStatus.Read().IsOnAc;
+            return (await _powerService.SetOverlayPowerModeAsync(mode, both || ac, both || !ac)).Message;
+        });
+    }
+    private async void ActivateItem_Click(object sender, RoutedEventArgs e) => await ChangeComponentAsync(sender, true);
+    private async void DeactivateItem_Click(object sender, RoutedEventArgs e) => await ChangeComponentAsync(sender, false);
+    private async Task ChangeComponentAsync(object sender, bool activate)
+    {
+        if (_actionBusy || sender is not Button { Tag: HpComponentRowViewModel row }) return;
+        row.SetBusy(true);
         try
         {
-            bool both = ChkApplyBothAcDc.IsChecked == true;
-            bool isAc = System.Windows.Forms.SystemInformation.PowerStatus.PowerLineStatus == System.Windows.Forms.PowerLineStatus.Online;
-            var (_, msg, _) = await _powerService.SetOverlayPowerModeAsync(mode, applyToAc: both || isAc, applyToDc: both || !isAc);
-
-            await RefreshAllDataAsync(updateStatusBar: false, showVisualLoading: true, loadingText: "Updating Power Mode...");
-            TxtStatusBar.Text = msg;
+            await RunActionAsync(async () => (activate ? await _bloatService.ActivateComponentAsync(row.Model)
+                : await _bloatService.DeactivateComponentAsync(row.Model)).Message, true);
         }
-        finally
-        {
-            _isActionBusy = false;
-            SetLoadingIndicator(false);
-        }
+        finally { row.SetBusy(false); }
     }
-
-    private async void BtnActivateItem_Click(object sender, RoutedEventArgs e)
-    {
-        if (sender is System.Windows.Controls.Button { Tag: HpComponentStatus item } btn)
-        {
-            _isActionBusy = true;
-            btn.IsEnabled = false;
-            if (_rowLookup.TryGetValue(item.Id, out var rowVm))
-                rowVm.SetBusyState(isActivating: true);
-            SetLoadingIndicator(true, $"Activating {item.DisplayName}...");
-            TxtStatusBar.Text = $"Activating '{item.DisplayName}'...";
-
-            try
-            {
-                var sw = Stopwatch.StartNew();
-                var (_, msg) = await _bloatService.ActivateComponentAsync(item);
-                await RefreshServicesAndProcessesAsync();
-                if (sw.ElapsedMilliseconds < 250)
-                    await Task.Delay(250 - (int)sw.ElapsedMilliseconds);
-                TxtStatusBar.Text = msg;
-            }
-            finally
-            {
-                _isActionBusy = false;
-                SetLoadingIndicator(false);
-            }
-        }
-    }
-
-    private async void BtnDeactivateItem_Click(object sender, RoutedEventArgs e)
-    {
-        if (sender is System.Windows.Controls.Button { Tag: HpComponentStatus item } btn)
-        {
-            _isActionBusy = true;
-            btn.IsEnabled = false;
-            if (_rowLookup.TryGetValue(item.Id, out var rowVm))
-                rowVm.SetBusyState(isActivating: false);
-            SetLoadingIndicator(true, $"Disabling {item.DisplayName}...");
-            TxtStatusBar.Text = $"Stopping & disabling '{item.DisplayName}'...";
-
-            try
-            {
-                var sw = Stopwatch.StartNew();
-                var (_, msg) = await _bloatService.DeactivateComponentAsync(item);
-                await RefreshServicesAndProcessesAsync();
-                if (sw.ElapsedMilliseconds < 250)
-                    await Task.Delay(250 - (int)sw.ElapsedMilliseconds);
-                TxtStatusBar.Text = msg;
-            }
-            finally
-            {
-                _isActionBusy = false;
-                SetLoadingIndicator(false);
-            }
-        }
-    }
-
-    private async void BtnDisableAllBloat_Click(object sender, RoutedEventArgs e)
-    {
-        if (_isActionBusy) return;
-        _isActionBusy = true;
-        BtnDisableAllBloat.IsEnabled = false;
-        object originalContent = BtnDisableAllBloat.Content;
-        BtnDisableAllBloat.Content = "⏳ Stopping Bloat & Watchdogs...";
-        SetLoadingIndicator(true, "Stopping watchdogs & bloat...");
-
-        try
-        {
-            var sw = Stopwatch.StartNew();
-            TxtStatusBar.Text = "Stopping and disabling watchdogs, telemetry & redundant HP background services...";
-            var (_, _, summary) = await _bloatService.DisableAllTelemetryAndBloatAsync();
-            await RefreshServicesAndProcessesAsync();
-            if (sw.ElapsedMilliseconds < 300)
-                await Task.Delay(300 - (int)sw.ElapsedMilliseconds);
-            TxtStatusBar.Text = summary;
-        }
-        finally
-        {
-            BtnDisableAllBloat.Content = originalContent;
-            BtnDisableAllBloat.IsEnabled = true;
-            _isActionBusy = false;
-            SetLoadingIndicator(false);
-        }
-    }
-
+    private async void BtnDisableAllBloat_Click(object sender, RoutedEventArgs e) => await DisableBloatAsync();
+    private Task DisableBloatAsync() => RunActionAsync(async () => (await _bloatService.DisableAllTelemetryAndBloatAsync()).Summary, true);
     private async void BtnRefresh_Click(object sender, RoutedEventArgs e)
     {
-        BtnRefresh.IsEnabled = false;
-        object originalContent = BtnRefresh.Content;
-        BtnRefresh.Content = "⏳ Refreshing...";
-
-        try
-        {
-            await RefreshAllDataAsync(updateStatusBar: false, showVisualLoading: true, loadingText: "Refreshing...");
-            TxtStatusBar.Text = $"Refreshed all hardware, watchdog & service indicators at {DateTime.Now:HH:mm:ss}.";
-        }
-        finally
-        {
-            BtnRefresh.Content = originalContent;
-            BtnRefresh.IsEnabled = true;
-        }
+        await RefreshAsync();
+        if (_page == "Sensors") StartSensorSample();
     }
-
-    private void BtnElevate_Click(object sender, RoutedEventArgs e)
-    {
-        try
-        {
-            string? exePath = Environment.ProcessPath;
-            if (!string.IsNullOrEmpty(exePath))
-            {
-                Process.Start(new ProcessStartInfo(exePath)
-                {
-                    UseShellExecute = true,
-                    Verb = "runas"
-                });
-                _isExiting = true;
-                Close();
-            }
-        }
-        catch (Exception ex)
-        {
-            TxtStatusBar.Text = $"Elevation cancelled: {ex.Message}";
-        }
-    }
-
-    private void InitializeTrayIcon()
-    {
-        Icon trayIco = SystemIcons.Shield;
-        try
-        {
-            if (!string.IsNullOrEmpty(Environment.ProcessPath))
-            {
-                trayIco = System.Drawing.Icon.ExtractAssociatedIcon(Environment.ProcessPath) ?? SystemIcons.Shield;
-            }
-        }
-        catch { }
-
-        _trayIcon = new System.Windows.Forms.NotifyIcon
-        {
-            Icon = trayIco,
-            Text = "HP Spectre Power & Service Control",
-            Visible = true
-        };
-
-        var menu = new System.Windows.Forms.ContextMenuStrip();
-        menu.Items.Add("Open Power Switcher", null, (_, _) => Dispatcher.InvokeAsync(ShowMainWindow));
-        menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
-        menu.Items.Add("⚡ Smart Sense", null, (_, _) => Dispatcher.InvokeAsync(() => ApplyThermalModeAsync(HpThermalMode.SmartSense)));
-        menu.Items.Add("⚖ Balanced", null, (_, _) => Dispatcher.InvokeAsync(() => ApplyThermalModeAsync(HpThermalMode.Balanced)));
-        menu.Items.Add("🚀 Performance", null, (_, _) => Dispatcher.InvokeAsync(() => ApplyThermalModeAsync(HpThermalMode.Performance)));
-        menu.Items.Add("❄ Cool", null, (_, _) => Dispatcher.InvokeAsync(() => ApplyThermalModeAsync(HpThermalMode.Cool)));
-        menu.Items.Add("🌙 Quiet", null, (_, _) => Dispatcher.InvokeAsync(() => ApplyThermalModeAsync(HpThermalMode.Quiet)));
-        menu.Items.Add("🍃 Power Saver", null, (_, _) => Dispatcher.InvokeAsync(() => ApplyThermalModeAsync(HpThermalMode.PowerSaver)));
-        menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
-        menu.Items.Add("🧹 Stop Telemetry & Bloat", null, (_, _) => Dispatcher.InvokeAsync(() => BtnDisableAllBloat_Click(this, new RoutedEventArgs())));
-        menu.Items.Add("Exit", null, (_, _) =>
-        {
-            _isExiting = true;
-            Dispatcher.InvokeAsync(Close);
-        });
-
-        _trayIcon.ContextMenuStrip = menu;
-        _trayIcon.DoubleClick += (_, _) => Dispatcher.InvokeAsync(ShowMainWindow);
-    }
-
     private async void ShowMainWindow()
     {
-        Show();
-        if (WindowState == WindowState.Minimized)
-            WindowState = WindowState.Normal;
+        if (_closing) return;
+        AppWindow.Show();
+        if (AppWindow.Presenter is OverlappedPresenter presenter) presenter.Restore();
         Activate();
-        await RefreshAllDataAsync(updateStatusBar: false);
+        UpdatePolling();
+        await RefreshAsync();
     }
-
-    private void MainWindow_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
+    private async void Window_Closing(AppWindow sender, AppWindowClosingEventArgs args)
     {
-        if (!_isExiting && ChkMinimizeToTray.IsChecked == true)
-        {
-            e.Cancel = true;
-            Hide();
-            return;
-        }
-
+        if (_allowClose) return;
+        args.Cancel = true;
+        if (_closing) return;
+        if (!_exitRequested && ChkMinimizeToTray.IsChecked == true && _tray != null)
+        { AppWindow.Hide(); UpdatePolling(); return; }
+        _closing = true;
         _refreshTimer.Stop();
         _sensorTimer?.Stop();
-        _sensors.Dispose();
-        if (_trayIcon != null)
+        // Never dispose counters while a worker is still sampling them.
+        await _sensorTask;
+        await _dataGate.WaitAsync();
+        try
         {
-            _trayIcon.Visible = false;
-            _trayIcon.Dispose();
+            if (_sensors != null) await Task.Run(_sensors.Dispose);
+            _tray?.Dispose();
+            _allowClose = true;
+            Close();
         }
+        finally { _dataGate.Release(); }
     }
 }

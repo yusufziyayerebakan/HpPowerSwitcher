@@ -181,11 +181,12 @@ public sealed class HpBloatManagerService
 
         // 1. Auto-Launcher & Respawn Watchdog Controls
         results.Add(GetUwpBackgroundWatchdogStatus());
-        results.Add(GetScheduledTaskWatchdogStatus());
+        var taskSnapshot = GetHpScheduledTasksSnapshot();
+        results.Add(GetScheduledTaskWatchdogStatus(taskSnapshot.TotalHpTasks, taskSnapshot.EnabledHpTasks));
         results.Add(GetRegistryRunWatchdogStatus());
 
         // 2. Targeted Process Groups
-        var (_, _, omenTasksEnabled) = GetHpScheduledTasksSnapshot();
+        bool omenTasksEnabled = taskSnapshot.OmenEnabled;
 
         foreach (var group in KnownProcessGroups)
         {
@@ -428,9 +429,8 @@ public sealed class HpBloatManagerService
             CanDeactivate: isWatchdogActive);
     }
 
-    private static HpComponentStatus GetScheduledTaskWatchdogStatus()
+    private static HpComponentStatus GetScheduledTaskWatchdogStatus(int total, int enabled)
     {
-        var (total, enabled, _) = GetHpScheduledTasksSnapshot();
         bool isActive = enabled > 0;
 
         return new HpComponentStatus(
@@ -799,48 +799,57 @@ public sealed class HpBloatManagerService
         int total = 0;
         int enabled = 0;
         bool omenEnabled = false;
+        dynamic? service = null;
 
         try
         {
             Type? schedType = Type.GetTypeFromProgID("Schedule.Service");
             if (schedType == null) return (8, 0, false);
 
-            dynamic? service = Activator.CreateInstance(schedType);
+            service = Activator.CreateInstance(schedType);
             if (service == null) return (8, 0, false);
 
             service.Connect();
 
             foreach (string folderPath in HpScheduledTaskFolders)
             {
+                dynamic? folder = null, tasks = null;
                 try
                 {
-                    dynamic folder = service.GetFolder(folderPath);
-                    dynamic tasks = folder.GetTasks(1);
+                    folder = service.GetFolder(folderPath);
+                    tasks = folder.GetTasks(1);
                     int count = (int)tasks.Count;
                     for (int i = 1; i <= count; i++)
                     {
                         dynamic task = tasks[i];
-                        string name = (string)task.Name;
-
-                        bool isHpTask = folderPath != @"\" || name.Contains("Omen", StringComparison.OrdinalIgnoreCase);
-                        if (!isHpTask) continue;
-
-                        total++;
-                        bool isTaskEnabled = (bool)task.Enabled;
-                        if (isTaskEnabled)
+                        try
                         {
-                            enabled++;
-                            if (name.Contains("Omen", StringComparison.OrdinalIgnoreCase))
-                                omenEnabled = true;
+                            string name = (string)task.Name;
+                            bool isHpTask = folderPath != @"\" || name.Contains("Omen", StringComparison.OrdinalIgnoreCase);
+                            if (!isHpTask) continue;
+                            total++;
+                            if ((bool)task.Enabled)
+                            {
+                                enabled++;
+                                if (name.Contains("Omen", StringComparison.OrdinalIgnoreCase)) omenEnabled = true;
+                            }
                         }
+                        finally { ReleaseComReference(task); }
                     }
                 }
                 catch { }
+                finally { ReleaseComReference(tasks); ReleaseComReference(folder); }
             }
         }
         catch { }
+        finally { ReleaseComReference(service); }
 
         return (total, enabled, omenEnabled);
+    }
+
+    private static void ReleaseComReference(object? value)
+    {
+        if (value != null && Marshal.IsComObject(value)) Marshal.ReleaseComObject(value);
     }
 
     private static int SetAllHpScheduledTasksEnabled(string? pattern, bool enable, bool startNow)

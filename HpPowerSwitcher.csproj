@@ -2,11 +2,17 @@
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net10.0-windows</TargetFramework>
+    <TargetFramework>net10.0-windows10.0.26100.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.19041.0</TargetPlatformMinVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <UseWPF>true</UseWPF>
-    <UseWindowsForms>true</UseWindowsForms>
+    <UseWinUI>true</UseWinUI>
+    <WindowsPackageType>None</WindowsPackageType>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>Assets\app.ico</ApplicationIcon>
     <AssemblyName>HpPowerSwitcher</AssemblyName>
@@ -15,11 +21,24 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <Resource Include="Assets\app.ico" />
+    <Compile Remove="Tests\**\*.cs" />
+    <Content Include="Assets\app.ico" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="System.Management" Version="10.0.13" />
+    <PackageReference Include="System.Diagnostics.PerformanceCounter" Version="10.0.13" />
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.6.4" />
   </ItemGroup>
+
+  <!-- Unpackaged WinUI's generated PRI/XBF resources must accompany the published executable. -->
+  <Target Name="PublishWinUIResources" AfterTargets="Publish">
+    <Error Condition="!Exists('$(TargetDir)$(AssemblyName).pri')" Text="The generated WinUI resource index is missing from the build output." />
+    <ItemGroup>
+      <_WinUIResource Include="$(TargetDir)$(AssemblyName).pri" />
+      <_WinUIResource Include="$(TargetDir)**\*.xbf" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_WinUIResource)" DestinationFiles="@(_WinUIResource->'$(PublishDir)%(RecursiveDir)%(Filename)%(Extension)')" SkipUnchangedFiles="true" />
+  </Target>
 
 </Project>

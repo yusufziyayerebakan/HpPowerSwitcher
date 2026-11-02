@@ -66,6 +66,8 @@ public sealed class HardwareSensorService : IDisposable
     // PDH GPU & NPU tracking
     private IntPtr _pdhQuery = IntPtr.Zero;
     private IntPtr _gpuCounter = IntPtr.Zero;
+    private IntPtr _gpuBuffer = IntPtr.Zero;
+    private uint _gpuBufferSize;
     private bool _pdhInitialized;
     private double _lastGpuLoad = double.NaN;
     private double _lastNpuLoad = double.NaN;
@@ -227,7 +229,7 @@ public sealed class HardwareSensorService : IDisposable
             $"GPU: {(_pdhInitialized ? "PDH" : "n/a")}  •  " +
             $"Disk: {(_diskTime != null ? "perf counters" : "n/a")}  •  " +
             $"Wi-Fi: {_wifiName}  •  " +
-            $"NPU: {(_lastNpuLoad >= 0 || _pdhInitialized ? "active" : "standby")}";
+            "NPU: PDH when exposed by driver";
 
         if (!isAdmin)
         {
@@ -330,52 +332,52 @@ public sealed class HardwareSensorService : IDisposable
             status = PdhGetFormattedCounterArrayW(_gpuCounter, PDH_FMT_DOUBLE, ref bufferSize, out itemCount, IntPtr.Zero);
             if ((status == ERROR_SUCCESS || status == PDH_MORE_DATA) && bufferSize > 0)
             {
-                IntPtr buffer = Marshal.AllocHGlobal((int)bufferSize);
-                try
+                if (bufferSize > _gpuBufferSize)
                 {
-                    status = PdhGetFormattedCounterArrayW(_gpuCounter, PDH_FMT_DOUBLE, ref bufferSize, out itemCount, buffer);
-                    if (status == ERROR_SUCCESS && itemCount > 0)
+                    _gpuBuffer = Marshal.ReAllocHGlobal(_gpuBuffer, checked((IntPtr)(long)bufferSize));
+                    _gpuBufferSize = bufferSize;
+                }
+                IntPtr buffer = _gpuBuffer;
+                status = PdhGetFormattedCounterArrayW(_gpuCounter, PDH_FMT_DOUBLE, ref bufferSize, out itemCount, buffer);
+                if (status == ERROR_SUCCESS && itemCount > 0)
+                {
+                    int structSize = Marshal.SizeOf<PDH_FMT_COUNTERVALUE_ITEM_W>();
+                    long ptr = buffer.ToInt64();
+                    double gpuSum = 0;
+                    double npuSum = 0;
+                    bool hasNpuEngine = false;
+
+                    for (uint i = 0; i < itemCount; i++)
                     {
-                        int structSize = Marshal.SizeOf<PDH_FMT_COUNTERVALUE_ITEM_W>();
-                        long ptr = buffer.ToInt64();
-                        double gpuSum = 0;
-                        double npuSum = 0;
+                        var item = Marshal.PtrToStructure<PDH_FMT_COUNTERVALUE_ITEM_W>(new IntPtr(ptr));
+                        string? name = Marshal.PtrToStringUni(item.szName);
+                        double val = item.FmtValue.doubleValue;
 
-                        for (uint i = 0; i < itemCount; i++)
+                        if (item.FmtValue.CStatus <= 1 && double.IsFinite(val) && !string.IsNullOrEmpty(name))
                         {
-                            var item = Marshal.PtrToStructure<PDH_FMT_COUNTERVALUE_ITEM_W>(new IntPtr(ptr));
-                            string? name = Marshal.PtrToStringUni(item.szName);
-                            double val = item.FmtValue.doubleValue;
-
-                            if (!double.IsNaN(val) && val > 0 && !string.IsNullOrEmpty(name))
+                            if (name.Contains("npu", StringComparison.OrdinalIgnoreCase) ||
+                                name.Contains("neural", StringComparison.OrdinalIgnoreCase))
                             {
-                                if (name.Contains("npu", StringComparison.OrdinalIgnoreCase) ||
-                                    name.Contains("neural", StringComparison.OrdinalIgnoreCase))
-                                {
-                                    npuSum += val;
-                                }
-                                else if (name.Contains("3D", StringComparison.OrdinalIgnoreCase) ||
-                                         name.Contains("Compute", StringComparison.OrdinalIgnoreCase))
-                                {
-                                    gpuSum += val;
-                                }
+                                hasNpuEngine = true;
+                                npuSum += val;
                             }
-
-                            ptr += structSize;
+                            else if (name.Contains("3D", StringComparison.OrdinalIgnoreCase) ||
+                                     name.Contains("Compute", StringComparison.OrdinalIgnoreCase))
+                            {
+                                gpuSum += val;
+                            }
                         }
 
-                        _lastGpuLoad = Math.Clamp(gpuSum, 0, 100);
-                        _lastNpuLoad = Math.Clamp(npuSum, 0, 100);
+                        ptr += structSize;
                     }
-                    else if (status == ERROR_SUCCESS)
-                    {
-                        _lastGpuLoad = 0;
-                        _lastNpuLoad = 0;
-                    }
+
+                    _lastGpuLoad = Math.Clamp(gpuSum, 0, 100);
+                    _lastNpuLoad = hasNpuEngine ? Math.Clamp(npuSum, 0, 100) : double.NaN;
                 }
-                finally
+                else if (status == ERROR_SUCCESS)
                 {
-                    Marshal.FreeHGlobal(buffer);
+                    _lastGpuLoad = 0;
+                    _lastNpuLoad = double.NaN;
                 }
             }
         }
@@ -387,7 +389,8 @@ public sealed class HardwareSensorService : IDisposable
         try
         {
             using var searcherGpu = new ManagementObjectSearcher("SELECT Name FROM Win32_VideoController");
-            foreach (ManagementObject o in searcherGpu.Get())
+            using var queryResults = searcherGpu.Get();
+            foreach (ManagementObject o in queryResults)
             {
                 using (o)
                 {
@@ -405,8 +408,9 @@ public sealed class HardwareSensorService : IDisposable
         try
         {
             using var searcherNpu = new ManagementObjectSearcher(
-                "SELECT Caption, Name FROM Win32_PnPEntity WHERE Caption LIKE '%AI Boost%' OR Caption LIKE '%NPU%' OR Caption LIKE '%Neural%'");
-            foreach (ManagementObject o in searcherNpu.Get())
+                "SELECT Caption, Name FROM Win32_PnPEntity WHERE Caption LIKE '%AI Boost%' OR Caption LIKE '% NPU%' OR Caption LIKE 'NPU%' OR Caption LIKE '%Neural%'");
+            using var queryResults = searcherNpu.Get();
+            foreach (ManagementObject o in queryResults)
             {
                 using (o)
                 {
@@ -424,14 +428,16 @@ public sealed class HardwareSensorService : IDisposable
 
     private static PerformanceCounter? TryCreate(string category, string counter, string instance)
     {
+        PerformanceCounter? c = null;
         try
         {
-            var c = new PerformanceCounter(category, counter, instance, readOnly: true);
+            c = new PerformanceCounter(category, counter, instance, readOnly: true);
             c.NextValue();
             return c;
         }
         catch
         {
+            c?.Dispose();
             return null;
         }
     }
@@ -462,10 +468,11 @@ public sealed class HardwareSensorService : IDisposable
         {
             _acpiSearcher ??= new ManagementObjectSearcher(@"\\.\root\wmi",
                 "SELECT CurrentTemperature FROM MSAcpi_ThermalZoneTemperature",
-                new EnumerationOptions { Timeout = TimeSpan.FromSeconds(2), ReturnImmediately = true });
+                new System.Management.EnumerationOptions { Timeout = TimeSpan.FromSeconds(2), ReturnImmediately = true });
 
             double best = double.NaN;
-            foreach (ManagementObject o in _acpiSearcher.Get())
+            using var queryResults = _acpiSearcher.Get();
+            foreach (ManagementObject o in queryResults)
             {
                 using (o)
                 {
@@ -528,9 +535,11 @@ public sealed class HardwareSensorService : IDisposable
         {
             _batterySearcher ??= new ManagementObjectSearcher(@"\\.\root\wmi",
                 "SELECT Charging, Discharging, ChargeRate, DischargeRate FROM BatteryStatus",
-                new EnumerationOptions { Timeout = TimeSpan.FromSeconds(2), ReturnImmediately = true });
+                new System.Management.EnumerationOptions { Timeout = TimeSpan.FromSeconds(2), ReturnImmediately = true });
 
-            foreach (ManagementObject o in _batterySearcher.Get())
+            using var queryResults = _batterySearcher.Get();
+
+            foreach (ManagementObject o in queryResults)
             {
                 using (o)
                 {
@@ -576,6 +585,12 @@ public sealed class HardwareSensorService : IDisposable
 
         _batterySearcher?.Dispose();
         _acpiSearcher?.Dispose();
+        if (_gpuBuffer != IntPtr.Zero)
+        {
+            Marshal.FreeHGlobal(_gpuBuffer);
+            _gpuBuffer = IntPtr.Zero;
+            _gpuBufferSize = 0;
+        }
     }
 
     [StructLayout(LayoutKind.Sequential)]
